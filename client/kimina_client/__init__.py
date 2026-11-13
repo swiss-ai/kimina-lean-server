@@ -24,10 +24,14 @@ from .models import (
     VerifyRequestBody,
     VerifyResponse,
 )
+from .stream import UNCHECKED_PREFIX, StreamingChecker, check_streaming
 from .sync_client import KiminaClient
 
 __all__ = [
     "AsyncKiminaClient",
+    "StreamingChecker",
+    "UNCHECKED_PREFIX",
+    "check_streaming",
     "BackwardResponse",
     "ReplRequest",
     "ReplResponse",
