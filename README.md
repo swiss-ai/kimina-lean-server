@@ -18,6 +18,13 @@ A Python SDK simplifies interaction with the server's API.
 
 Read the [Technical Report](./Technical_Report.pdf) for more details.
 
+> **swiss-ai fork.** This fork adds settings for many-core nodes (tens to hundreds of REPLs on one machine),
+> fixes for failures that are otherwise silent, and a streaming client. Every new setting defaults to upstream
+> behaviour. On a 288-core GH200 node, upstream's per-REPL psutil samplers kept the server's event loop
+> saturated: about 1 proof/s. With the recommended settings the same node checked 26–31 proofs/s. See
+> [docs/MANY_CORE_NODES.md](docs/MANY_CORE_NODES.md) for the settings, the measurements and running Lean from
+> node memory, and [Settings added in this fork](#settings-added-in-this-fork) below.
+
 ## Table of Contents
 
 - [Server](#server)
@@ -104,6 +111,14 @@ client.check("#check Nat")
 
 Or from source with `pip install -e .`
 
+This fork's client (from source; not in the PyPI release) also checks proofs one request each, as soon as they
+are available, with a bounded number in flight:
+```python
+from kimina_client import check_streaming
+results = check_streaming(["#check Nat", "theorem t : 1 + 1 = 2 := by rfl"], max_inflight=64, timeout=60)
+```
+or, in async code, `async with StreamingChecker(max_inflight=64) as c: task = c.submit(snippet)`.
+
 ## ⚙️ Environment Variables
 
 | Variable                              | Default       | Description                                            |
@@ -125,6 +140,29 @@ Or from source with `pip install -e .`
 
 `LEAN_SERVER_MAX_REPL_MEM` can help avoid certain OOM issues (see Issue #25)
 The server also runs all commands with `"gc": true` to automatically discard environments which helps limit memory usage.
+
+### Settings added in this fork
+
+All default to upstream behaviour; [docs/MANY_CORE_NODES.md](docs/MANY_CORE_NODES.md) gives recommended values.
+
+| Variable                              | Default | Description |
+| ------------------------------------- | ------- | ----------- |
+| `LEAN_SERVER_MONITOR_REPLS`           | `true`  | Sample each REPL's CPU and memory with psutil once per second. Each sample walks the process table on the event loop; turn off with many REPLs |
+| `LEAN_SERVER_LOG_SNIPPETS`            | `true`  | Log every snippet's code and every response at `INFO` |
+| `LEAN_SERVER_DIRECT_EXEC`             | `false` | Start the REPL binary directly with the environment `lake env` would set, resolved once, instead of one `lake env` process per REPL |
+| `LEAN_SERVER_LEAN_PATH`               |         | With `DIRECT_EXEC`: use this `LEAN_PATH` instead of asking `lake env` (e.g. a copy of the packages in `/dev/shm`) |
+| `LEAN_SERVER_LEAN_SYSROOT`            |         | With `DIRECT_EXEC`: the toolchain directory to use as `LEAN_SYSROOT` |
+| `LEAN_SERVER_HEADER_TIMEOUT`          |         | Timeout for importing a REPL's header. Unset: the snippet's own timeout, as upstream |
+| `LEAN_SERVER_PREWARM`                 | `false` | Replace a destroyed or exhausted REPL of an `INIT_REPLS` header in the background; requests wait for the warm replacement |
+| `LEAN_SERVER_CHECK_HEADER`            | `false` | After importing a header, check that the environment is not empty. A failed import otherwise answers `{"env": 0}` silently, and every proof then fails as if wrong |
+
+Also in this fork, for all settings:
+- `/api/check` answers as soon as the checks end. Upstream polled for a client disconnect every 0.1 s, so every response took at least 100 ms.
+- A REPL's stderr is kept, and a REPL that dies is reported with its exit code.
+- A failed initial REPL is replaced instead of stopping start-up.
+- A header error is answered under the snippet's own ID.
+- `GET /stats` shows the pool and its counters.
+- `prisma` and `google-cloud-logging` are imported only when used.
 
 
 
