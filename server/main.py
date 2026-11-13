@@ -46,6 +46,12 @@ def create_app(settings: Settings) -> FastAPI:
             max_repl_uses=settings.max_repl_uses,
             max_repl_mem=settings.max_repl_mem,
             init_repls=settings.init_repls,
+            monitor_repls=settings.monitor_repls,
+            log_snippets=settings.log_snippets,
+            direct_exec=settings.direct_exec,
+            header_timeout=settings.header_timeout,
+            prewarm=settings.prewarm,
+            check_header=settings.check_header,
         )
         app.state.manager = manager
         await app.state.manager.initialize_repls()

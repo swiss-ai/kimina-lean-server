@@ -1,6 +1,3 @@
-from google.auth.exceptions import DefaultCredentialsError
-from google.cloud.logging import Client as GCPClient
-from google.cloud.logging.handlers import CloudLoggingHandler
 from loguru import logger
 from rich.console import Console
 from rich.logging import RichHandler
@@ -17,6 +14,17 @@ def setup_logging() -> None:
 
     if settings.environment == Environment.prod:
         try:
+            # Optional dependency: on clusters without it (or without GCP credentials)
+            # the server logs to the console instead, as upstream does without credentials.
+            from google.auth.exceptions import DefaultCredentialsError
+            from google.cloud.logging import Client as GCPClient
+            from google.cloud.logging.handlers import CloudLoggingHandler
+        except ImportError:
+            GCPClient = None  # type: ignore[assignment,misc]
+            DefaultCredentialsError = Exception  # type: ignore[assignment,misc]
+        try:
+            if GCPClient is None:
+                raise DefaultCredentialsError("google-cloud-logging is not installed")
             gcp_client = GCPClient()
             gcp_handler = CloudLoggingHandler(gcp_client)
             logger.add(gcp_handler, level="INFO", serialize=True)

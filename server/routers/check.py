@@ -87,7 +87,9 @@ async def run_checks(
             try:
                 prep = await manager.prep(repl, snippet.id, timeout, debug)
                 if prep and prep.error:
-                    return prep
+                    # The header's response carries the ID "<id>-header"; answer under
+                    # the snippet's own ID so the caller can match it.
+                    return prep.model_copy(update={"id": snippet.id})
             except TimeoutError:
                 error = f"Lean REPL header command timed out in {timeout} seconds"
                 uuid_hex = repl.uuid.hex
@@ -146,24 +148,26 @@ async def run_checks(
                         "repl_uuid": uuid_hex,
                     },
                 )
-                logger.info(
-                    "[{}] Response for [bold magenta]{}[/bold magenta] body →\n{}",
-                    repl.uuid.hex[:8],
-                    snippet.id,
-                    json.dumps(resp.model_dump(exclude_none=True), indent=2),
-                )
+                if manager.log_snippets:
+                    logger.info(
+                        "[{}] Response for [bold magenta]{}[/bold magenta] body →\n{}",
+                        repl.uuid.hex[:8],
+                        snippet.id,
+                        json.dumps(resp.model_dump(exclude_none=True), indent=2),
+                    )
                 return resp
             except Exception as e:
                 logger.exception("Snippet execution failed")
                 await manager.destroy_repl(repl)
                 raise HTTPException(500, str(e)) from e
             else:
-                logger.info(
-                    "[{}] Response for [bold magenta]{}[/bold magenta] body →\n{}",
-                    repl.uuid.hex[:8],
-                    snippet.id,
-                    json.dumps(resp.model_dump(exclude_none=True), indent=2),
-                )
+                if manager.log_snippets:
+                    logger.info(
+                        "[{}] Response for [bold magenta]{}[/bold magenta] body →\n{}",
+                        repl.uuid.hex[:8],
+                        snippet.id,
+                        json.dumps(resp.model_dump(exclude_none=True), indent=2),
+                    )
                 await manager.release_repl(repl)
                 # TODO: Try catch everything DB related
                 if db.connected:
@@ -224,11 +228,31 @@ async def check(
         )
     )
 
-    while not task.done():
-        if await raw_request.is_disconnected():
-            task.cancel()
-            raise HTTPException(499, "Client disconnected")
-        await asyncio.sleep(0.1)
+    # Return as soon as the checks finish. Upstream polled for a client disconnect every
+    # 0.1 s, which added up to 100 ms to every response (50 ms on average): as much as a
+    # warm proof check takes. Waiting on the disconnect event itself keeps the
+    # cancel-on-disconnect behaviour without the delay.
+    watcher = asyncio.create_task(_wait_for_disconnect(raw_request))
+    try:
+        await asyncio.wait({task, watcher}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    finally:
+        if not watcher.done():
+            watcher.cancel()
+    if not task.done():
+        task.cancel()
+        raise HTTPException(499, "Client disconnected")
 
     results = await task
     return CheckResponse(results=results)
+
+
+async def _wait_for_disconnect(request: Request) -> None:
+    """Return when the client disconnects. The request body has already been read, so the
+    next ASGI message is `http.disconnect` (sent on disconnect, or once the response is done)."""
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return

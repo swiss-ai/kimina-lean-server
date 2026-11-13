@@ -64,9 +64,16 @@ class Repl:
         *,
         max_repl_mem: int,
         max_repl_uses: int,
+        monitor: bool = True,
+        log_snippets: bool = True,
+        exec_env: dict[str, str] | None = None,
     ) -> None:
         self.uuid = uuid
         self.header = header
+        # See Settings.monitor_repls, Settings.log_snippets and Settings.direct_exec.
+        self.monitor = monitor
+        self.log_snippets = log_snippets
+        self.exec_env = exec_env
         self.use_count = 0
         self.created_at = created_at
         self.last_check_at = created_at
@@ -94,7 +101,21 @@ class Repl:
         self._mem_task: asyncio.Task[None] | None = None
 
     @classmethod
-    async def create(cls, header: str, max_repl_uses: int, max_repl_mem: int) -> "Repl":
+    async def create(
+        cls,
+        header: str,
+        max_repl_uses: int,
+        max_repl_mem: int,
+        *,
+        monitor: bool = True,
+        log_snippets: bool = True,
+        exec_env: dict[str, str] | None = None,
+    ) -> "Repl":
+        options = {
+            "monitor": monitor,
+            "log_snippets": log_snippets,
+            "exec_env": exec_env,
+        }
         if db.connected:
             record = await prisma.repl.create(
                 data={
@@ -109,6 +130,7 @@ class Repl:
                 header=record.header,
                 max_repl_uses=record.max_repl_uses,
                 max_repl_mem=record.max_repl_mem,
+                **options,  # type: ignore[arg-type]
             )
         return cls(
             uuid=uuid4(),
@@ -116,6 +138,7 @@ class Repl:
             header=header,
             max_repl_uses=max_repl_uses,
             max_repl_mem=max_repl_mem,
+            **options,  # type: ignore[arg-type]
         )
 
     @property
@@ -146,27 +169,36 @@ class Repl:
 
             os.setsid()
 
+        if self.exec_env is not None:
+            # The environment `lake env` sets, resolved once (lean_env.py): one process
+            # per REPL instead of lake plus the REPL, and no lake start-up per REPL.
+            command: tuple[str | os.PathLike[str], ...] = (settings.repl_path,)
+            env = self.exec_env
+        else:
+            command = ("lake", "env", settings.repl_path)
+            env = dict(os.environ)
         self.proc = await asyncio.create_subprocess_exec(
-            "lake",
-            "env",
-            settings.repl_path,
+            *command,
             cwd=settings.project_dir,
-            env=os.environ,
+            env=env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            # Upstream piped stderr and never read the pipe, while `send` reads error_file,
+            # which stayed empty: a REPL that died left no trace. Its stderr now goes to
+            # error_file, and is reported when the REPL stops answering.
+            stderr=self.error_file,
             preexec_fn=_preexec,
         )
 
-        self._ps_proc = psutil.Process(self.proc.pid)
-        now = self._loop.time()
-        self._last_check = now
-        self._last_cpu_time = self._sum_cpu_times(self._ps_proc)
-
         self._cpu_max = 0.0
         self._mem_max = 0
-        self._cpu_task = self._loop.create_task(self._cpu_monitor())
-        self._mem_task = self._loop.create_task(self._mem_monitor())
+        if self.monitor:
+            self._ps_proc = psutil.Process(self.proc.pid)
+            now = self._loop.time()
+            self._last_check = now
+            self._last_cpu_time = self._sum_cpu_times(self._ps_proc)
+            self._cpu_task = self._loop.create_task(self._cpu_monitor())
+            self._mem_task = self._loop.create_task(self._mem_monitor())
 
         logger.info(f"\\[{self.uuid.hex[:8]}] Started")
 
@@ -250,7 +282,8 @@ class Repl:
         is_header: bool = False,
         infotree: Infotree | None = None,
     ) -> tuple[CommandResponse | Error, float, Diagnostics]:
-        await log_snippet(self.uuid, snippet.id, snippet.code)
+        if self.log_snippets:
+            await log_snippet(self.uuid, snippet.id, snippet.code)
 
         self._cpu_max = 0.0
         self._mem_max = 0
@@ -298,16 +331,29 @@ class Repl:
         try:
             resp: CommandResponse | Error = json.loads(raw)
         except json.JSONDecodeError:
+            if not raw:
+                # EOF: the REPL process is gone (killed, crashed, out of memory).
+                try:
+                    await asyncio.wait_for(self.proc.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    pass
+                stderr = self._take_stderr()[-2000:]
+                logger.error(
+                    "REPL {} exited ({}) without answering; stderr: {}",
+                    self.uuid.hex[:8],
+                    self.proc.returncode,
+                    stderr or "<empty>",
+                )
+                raise ReplError(
+                    f"REPL exited with code {self.proc.returncode} without answering"
+                    + (f": {stderr}" if stderr else "")
+                )
             logger.error("JSON decode error: %r", raw)
             raise ReplError("JSON decode error")
 
-        self.error_file.seek(0)
-        err = self.error_file.read().strip()
-        self.error_file.seek(0)
-        self.error_file.truncate(0)
-        if err:
-            logger.error("Stderr: %s", err)
-            raise LeanError(err)
+        # What the REPL wrote to stderr meanwhile (a proof may print there) does not fail
+        # the command, as it never did upstream; it is only kept for a crash report.
+        self._take_stderr()
 
         elapsed_time = round(elapsed, 6)
         diagnostics: Diagnostics = {
@@ -321,6 +367,15 @@ class Repl:
 
         self.use_count += 1
         return resp, elapsed_time, diagnostics
+
+    def _take_stderr(self) -> str:
+        """Return and clear what the REPL wrote to stderr since the last call."""
+        self.error_file.flush()
+        self.error_file.seek(0)
+        err = self.error_file.read().strip()
+        self.error_file.seek(0)
+        self.error_file.truncate(0)
+        return err
 
     async def _read_response(self) -> bytes:
         if not self.proc or self.proc.stdout is None:
