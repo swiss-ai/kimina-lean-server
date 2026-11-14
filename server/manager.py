@@ -20,6 +20,9 @@ from .utils import is_blank
 # so a broken header (or a broken toolchain) cannot keep the server importing forever.
 MAX_PREWARM_FAILURES = 3
 
+# How long cleanup() waits for its cancelled replacements, then for the REPLs it closes.
+CLEANUP_TIMEOUT = 30.0
+
 
 class Manager:
     def __init__(
@@ -58,6 +61,8 @@ class Manager:
         self._exec_env: dict[str, str] | None = None
         self._exec_env_lock: asyncio.Lock | None = None
         self._background: set[asyncio.Task[None]] = set()
+        self._closers: set[asyncio.Task[None]] = set()
+        self._closed = False
         self._prewarm_failures: dict[str, int] = {}
 
         self.stats: dict[str, float] = {
@@ -148,7 +153,9 @@ class Manager:
 
         async def _prep_and_release(repl: Repl) -> None:
             # All initialized imports should finish in 60 seconds (header_timeout if set).
-            resp = await self.prep(repl, snippet_id="init", timeout=60, debug=False)
+            resp = await self.prep(
+                repl, snippet_id="init", timeout=60, debug=False, replace=False
+            )
             if resp is not None and resp.error:
                 raise ReplError(resp.error)  # prep() has destroyed it already
             await self.release_repl(repl)
@@ -156,6 +163,9 @@ class Manager:
         # One REPL that fails to import (killed for memory, a crash) no longer stops the
         # server, as it did upstream; it is discarded (and replaced when prewarm is on).
         # The server still refuses to start if no REPL at all could import its header.
+        # Replacements start only once all imports are done and at least one succeeded: when
+        # all fail, none is started. (Started at once, they were still being spawned when
+        # the server gave up, and asyncio.run() then hung at exit; see cleanup().)
         results = await asyncio.gather(
             *(_prep_and_release(r) for r in initialized_repls), return_exceptions=True
         )
@@ -165,9 +175,11 @@ class Manager:
         for repl, error in failed:
             logger.error("Initial REPL {} failed: {}", repl.uuid.hex[:8], error)
             if repl in self._busy or repl in self._free:
-                await self.destroy_repl(repl)
+                await self.destroy_repl(repl, replace=False)
         if failed and len(failed) == len(initialized_repls):
             raise RuntimeError(f"No initial REPL could import its header: {failed[0][1]}")
+        for repl, _ in failed:
+            await self._refill(repl.header)
         self.stats["init_failed"] = len(failed)
 
         logger.info(f"Initialized REPLs with: {json.dumps(self.init_repls, indent=2)}")
@@ -244,7 +256,7 @@ class Manager:
 
         self._count_wait(wait_started)
         if repl_to_destroy is not None:
-            asyncio.create_task(close_verbose(repl_to_destroy))
+            self._close_later(repl_to_destroy)
 
         return await self._start_reserved(header)
 
@@ -280,7 +292,7 @@ class Manager:
     def _reserve_replacement(self, header: str) -> bool:
         """Under the lock: keep the slot of a removed REPL of a pre-warmed header for a
         warm replacement. Returns False (the caller then frees the slot) otherwise."""
-        if not self.prewarm or self.init_repls.get(header, 0) <= 0:
+        if self._closed or not self.prewarm or self.init_repls.get(header, 0) <= 0:
             return False
         if self._prewarm_failures.get(header, 0) >= MAX_PREWARM_FAILURES:
             return False
@@ -291,6 +303,15 @@ class Manager:
         task.add_done_callback(self._background.discard)
         return True
 
+    async def _refill(self, header: str) -> None:
+        """Start a warm replacement for a REPL of `header` that was destroyed without one,
+        if prewarm allows it and a slot is free."""
+        self._ensure_lock()
+        assert self._cond is not None  # Type narrowing after _ensure_lock
+        async with self._cond:
+            if len(self._free) + len(self._busy) + self._starting < self.max_repls:
+                self._reserve_replacement(header)
+
     async def _warm_replacement(self, header: str) -> None:
         try:
             repl = await self._start_reserved(header)
@@ -298,16 +319,22 @@ class Manager:
             logger.exception("Could not create a replacement REPL")
             self._prewarm_failed(header)
             return
+        # A failure is counted before the next replacement is decided, so that
+        # MAX_PREWARM_FAILURES bounds the replacements (it used to be checked first, and
+        # every failed replacement started one more).
         try:
-            resp = await self.prep(repl, snippet_id="prewarm", timeout=600, debug=False)
+            resp = await self.prep(
+                repl, snippet_id="prewarm", timeout=600, debug=False, replace=False
+            )
         except Exception:
             logger.exception("Warming a replacement REPL failed")
             self._prewarm_failed(header)
             await self.destroy_repl(repl)
             return
         if resp is not None and resp.error:
-            # prep() already destroyed it.
+            # prep() already destroyed it, without a replacement.
             self._prewarm_failed(header)
+            await self._refill(header)
             return
         self._prewarm_failures[header] = 0
         self.stats["prewarm_ready"] += 1
@@ -317,7 +344,15 @@ class Manager:
         self.stats["prewarm_failed"] += 1
         self._prewarm_failures[header] = self._prewarm_failures.get(header, 0) + 1
 
-    async def destroy_repl(self, repl: Repl) -> None:
+    def _close_later(self, repl: Repl) -> None:
+        """Close a REPL in the background; cleanup() waits for it."""
+        task = asyncio.create_task(close_verbose(repl))
+        self._closers.add(task)
+        task.add_done_callback(self._closers.discard)
+
+    async def destroy_repl(self, repl: Repl, *, replace: bool = True) -> None:
+        """Remove a REPL from the pool and close it. With `replace` (and prewarm), a warm
+        replacement takes its slot."""
         self._ensure_lock()
         assert self._cond is not None  # Type narrowing after _ensure_lock
         async with self._cond:
@@ -325,9 +360,9 @@ class Manager:
             self._busy.discard(repl)
             if repl in self._free:
                 self._free.remove(repl)
-            asyncio.create_task(close_verbose(repl))
+            self._close_later(repl)
             self.stats["repls_destroyed"] += 1
-            if not (was_held and self._reserve_replacement(repl.header)):
+            if not (replace and was_held and self._reserve_replacement(repl.header)):
                 self._cond.notify(1)
 
     async def release_repl(self, repl: Repl) -> None:
@@ -345,7 +380,7 @@ class Manager:
                 logger.info(f"REPL {uuid.hex[:8]} is exhausted, closing it")
                 self._busy.discard(repl)
 
-                asyncio.create_task(close_verbose(repl))
+                self._close_later(repl)
                 if not self._reserve_replacement(repl.header):
                     self._cond.notify(1)
                 return
@@ -363,22 +398,41 @@ class Manager:
         return await self._start_reserved(header)
 
     async def cleanup(self) -> None:
+        """Close the pool, and return only once its own tasks are done.
+
+        A task still inside `asyncio.create_subprocess_exec` when asyncio.run() cancels
+        every task at exit never finishes: asyncio's cancelled spawn waits for pipes that
+        never connected. The process then hung after "Application startup failed" with its
+        REPLs running. So no new replacement starts, the running ones are cancelled and
+        awaited (a cancelled spawn kills its process), and every close is awaited."""
         self._ensure_lock()
         assert self._cond is not None  # Type narrowing after _ensure_lock
-        for task in list(self._background):
+        logger.info("Cleaning up REPL manager...")
+        self._closed = True
+        replacements = list(self._background)
+        for task in replacements:
             task.cancel()
+        await self._wait_for(replacements, "replacement REPLs")
         async with self._cond:
-            logger.info("Cleaning up REPL manager...")
-            for repl in self._free:
-                asyncio.create_task(close_verbose(repl))
+            for repl in [*self._free, *self._busy]:
+                self._close_later(repl)
             self._free.clear()
-
-            for repl in self._busy:
-                asyncio.create_task(close_verbose(repl))
             self._busy.clear()
+        await self._wait_for(list(self._closers), "REPL closes")
+        logger.info("REPL manager cleaned up!")
 
-            logger.info("REPL manager cleaned up!")
-        pass
+    @staticmethod
+    async def _wait_for(tasks: list[asyncio.Task[None]], what: str) -> None:
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=CLEANUP_TIMEOUT)
+        for task in done:
+            if not task.cancelled() and task.exception() is not None:
+                logger.warning("One of the {} failed: {!r}", what, task.exception())
+        if pending:
+            logger.warning(
+                "{} of {} still running after {}s", len(pending), what, CLEANUP_TIMEOUT
+            )
 
     async def _header_failure(self, repl: Repl, snippet_id: str) -> str | None:
         """Elaborate `#check Nat` in the header's environment: it fails only if the import
@@ -403,8 +457,16 @@ class Manager:
         return None
 
     async def prep(
-        self, repl: Repl, snippet_id: str, timeout: float, debug: bool
+        self,
+        repl: Repl,
+        snippet_id: str,
+        timeout: float,
+        debug: bool,
+        *,
+        replace: bool = True,
     ) -> ReplResponse | None:
+        """Start the REPL and import its header. A REPL whose header fails to import is
+        destroyed (with a warm replacement if `replace` and prewarm allow one)."""
         if repl.is_running:
             return None
 
@@ -445,7 +507,7 @@ class Manager:
             if cmd_response.error:
                 self.stats["header_imports_failed"] += 1
                 logger.error(f"Header command failed: {cmd_response.error}")
-                await self.destroy_repl(repl)
+                await self.destroy_repl(repl, replace=replace)
 
             repl.header_cmd_response = cmd_response
 

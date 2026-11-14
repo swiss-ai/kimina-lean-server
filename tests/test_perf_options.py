@@ -4,6 +4,8 @@ header_timeout, prewarm), the event-driven disconnect wait and GET /stats."""
 import asyncio
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from uuid import uuid4
@@ -270,3 +272,94 @@ async def test_server_refuses_to_start_when_no_initial_repl_imports() -> None:
     with pytest.raises(RuntimeError, match="No initial REPL"):
         await manager.initialize_repls()
     await manager.cleanup()
+
+
+async def test_no_replacement_starts_when_every_initial_repl_fails() -> None:
+    manager = Manager(
+        max_repls=2,
+        max_repl_uses=-1,
+        init_repls={"import NonExistentModuleXyz": 2},
+        check_header=True,
+        prewarm=True,
+    )
+    with pytest.raises(RuntimeError, match="No initial REPL"):
+        await manager.initialize_repls()
+    started = manager.stats["prewarm_started"]
+    # Let any replacement finish before asserting: one still being spawned when the test's
+    # event loop closes would hang the test run (the bug test_server_exits_... is about).
+    deadline = time.monotonic() + 60
+    while (manager._background or manager._starting) and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    assert started == 0
+    await manager.cleanup()
+    assert not manager._closers
+
+
+async def test_prewarm_failures_are_counted_before_the_next_replacement() -> None:
+    """A replacement whose import fails used to start the next one before its failure was
+    counted, so MAX_PREWARM_FAILURES was always exceeded."""
+    from server.manager import MAX_PREWARM_FAILURES
+
+    bad = "import NonExistentModuleXyz"
+    manager = Manager(
+        max_repls=2,
+        max_repl_uses=-1,
+        init_repls={"import Init": 1, bad: 1},
+        check_header=True,
+        prewarm=True,
+    )
+    await manager.initialize_repls()  # the bad header's REPL is replaced, as before
+    deadline = time.monotonic() + 60
+    while (manager._background or manager._starting) and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    assert manager.stats["prewarm_started"] == MAX_PREWARM_FAILURES
+    assert manager.stats["prewarm_failed"] == MAX_PREWARM_FAILURES
+    assert [r.header for r in manager._free] == ["import Init"]
+    await manager.cleanup()
+
+
+def test_server_exits_when_its_start_up_fails() -> None:
+    """With prewarm, the failed initial REPLs' replacements were still being spawned when
+    uvicorn gave up. asyncio.run() then waited forever for them at exit: the server logged
+    "Application startup failed" and kept running (and its REPLs with it)."""
+    marker = uuid4().hex
+    script = (
+        "import uvicorn\n"
+        "from server.main import create_app\n"
+        "from server.settings import Environment, Settings\n"
+        "s = Settings(_env_file=None)\n"
+        "for k, v in dict(max_repls=8, max_repl_uses=-1, init_repls={'import NonExistentModuleXyz': 8},\n"
+        "        prewarm=True, check_header=True, monitor_repls=False, log_snippets=False,\n"
+        "        database_url=None, environment=Environment.prod).items():\n"
+        "    setattr(s, k, v)\n"
+        f"uvicorn.run(create_app(s), host='127.0.0.1', port={_free_port()}, log_config=None)\n"
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(p for p in sys.path if p),
+        "KIMINA_TEST_MARKER": marker,  # inherited by the REPLs
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        out, _ = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _ = proc.communicate()
+        pytest.fail("the server was still running 60 s after its start-up failed:\n" + out[-3000:])
+    assert "Application startup failed" in out, out[-3000:]
+    assert proc.returncode != 0
+
+    left = []
+    for p in psutil.process_iter():
+        try:
+            if p.environ().get("KIMINA_TEST_MARKER") == marker:
+                left.append(p.cmdline())
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+            pass
+    assert not left, left

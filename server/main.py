@@ -54,7 +54,14 @@ def create_app(settings: Settings) -> FastAPI:
             check_header=settings.check_header,
         )
         app.state.manager = manager
-        await app.state.manager.initialize_repls()
+        try:
+            await manager.initialize_repls()
+        except BaseException:
+            # uvicorn exits after "Application startup failed", but only once asyncio.run()
+            # has finished every task: close the pool first (see Manager.cleanup).
+            await manager.cleanup()
+            await db.disconnect()
+            raise
 
         if settings.environment == Environment.dev:
             threading.Timer(

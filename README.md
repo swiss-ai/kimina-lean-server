@@ -153,13 +153,14 @@ All default to upstream behaviour; [docs/MANY_CORE_NODES.md](docs/MANY_CORE_NODE
 | `LEAN_SERVER_LEAN_PATH`               |         | With `DIRECT_EXEC`: use this `LEAN_PATH` instead of asking `lake env` (e.g. a copy of the packages in `/dev/shm`) |
 | `LEAN_SERVER_LEAN_SYSROOT`            |         | With `DIRECT_EXEC`: the toolchain directory to use as `LEAN_SYSROOT` |
 | `LEAN_SERVER_HEADER_TIMEOUT`          |         | Timeout for importing a REPL's header. Unset: the snippet's own timeout, as upstream |
-| `LEAN_SERVER_PREWARM`                 | `false` | Replace a destroyed or exhausted REPL of an `INIT_REPLS` header in the background; requests wait for the warm replacement |
+| `LEAN_SERVER_PREWARM`                 | `false` | Replace a destroyed or exhausted REPL of an `INIT_REPLS` header in the background; requests wait for the warm replacement. A header whose replacements fail 3 times in a row is no longer replaced |
 | `LEAN_SERVER_CHECK_HEADER`            | `false` | After importing a header, check that the environment is not empty. A failed import otherwise answers `{"env": 0}` silently, and every proof then fails as if wrong |
 
 Also in this fork, for all settings:
 - `/api/check` answers as soon as the checks end. Upstream polled for a client disconnect every 0.1 s, so every response took at least 100 ms.
 - A REPL's stderr is kept, and a REPL that dies is reported with its exit code.
 - A failed initial REPL is replaced instead of stopping start-up.
+- If every initial REPL fails, the server starts no replacement, closes its REPLs and exits after uvicorn's `Application startup failed`.
 - A header error is answered under the snippet's own ID.
 - `GET /stats` shows the pool and its counters.
 - `prisma` and `google-cloud-logging` are imported only when used.
